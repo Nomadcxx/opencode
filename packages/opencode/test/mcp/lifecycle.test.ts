@@ -17,17 +17,25 @@ import { TestInstance } from "../fixture/fixture"
 
 // Per-client state for controlling mock behavior
 interface MockClientState {
-  capabilities: { tools?: object; prompts?: object; resources?: object }
+  capabilities: { tools?: object; prompts?: object; resources?: object; completions?: object }
   capabilitiesShouldThrow: boolean
   tools: Array<{ name: string; description?: string; inputSchema: object; outputSchema?: object }>
   listToolsCalls: number
   listPromptsCalls: number
   listResourcesCalls: number
+  listResourceTemplatesCalls: number
+  completeCalls: number
   readResourceCalls: number
   subscribedResources: string[]
   unsubscribedResources: string[]
   getPromptTimeout?: number
+  completeTimeout?: number
   readResourceTimeout?: number
+  completeRequests: Array<{
+    ref: { type: "ref/prompt"; name: string } | { type: "ref/resource"; uri: string }
+    argument: { name: string; value: string }
+    context?: { arguments?: Record<string, string> }
+  }>
   requestCalls: number
   listToolsShouldFail: boolean
   listToolsError: string
@@ -35,6 +43,7 @@ interface MockClientState {
   listResourcesShouldFail: boolean
   prompts: Array<{ name: string; description?: string }>
   resources: Array<{ name: string; uri: string; description?: string }>
+  resourceTemplates: Array<{ name: string; uriTemplate: string; description?: string }>
   toolPages: Record<
     string,
     {
@@ -46,6 +55,10 @@ interface MockClientState {
   resourcePages: Record<
     string,
     { resources: Array<{ name: string; uri: string; description?: string }>; nextCursor?: string }
+  >
+  resourceTemplatePages: Record<
+    string,
+    { resourceTemplates: Array<{ name: string; uriTemplate: string; description?: string }>; nextCursor?: string }
   >
   closed: boolean
   clientOptions?: { capabilities?: { roots?: { listChanged?: boolean } } }
@@ -76,9 +89,12 @@ function getOrCreateClientState(name?: string): MockClientState {
       listToolsCalls: 0,
       listPromptsCalls: 0,
       listResourcesCalls: 0,
+      listResourceTemplatesCalls: 0,
+      completeCalls: 0,
       readResourceCalls: 0,
       subscribedResources: [],
       unsubscribedResources: [],
+      completeRequests: [],
       requestCalls: 0,
       listToolsShouldFail: false,
       listToolsError: "listTools failed",
@@ -86,9 +102,11 @@ function getOrCreateClientState(name?: string): MockClientState {
       listResourcesShouldFail: false,
       prompts: [],
       resources: [],
+      resourceTemplates: [],
       toolPages: {},
       promptPages: {},
       resourcePages: {},
+      resourceTemplatePages: {},
       closed: false,
       requestHandlers: new Map(),
       notificationHandlers: new Map(),
@@ -236,6 +254,29 @@ void mock.module("@modelcontextprotocol/sdk/client/index.js", () => ({
       return { resources: this._state?.resources ?? [] }
     }
 
+    async listResourceTemplates(params?: { cursor?: string }) {
+      if (this._state) this._state.listResourceTemplatesCalls++
+      const page = this._state?.resourceTemplatePages[params === undefined ? "initial" : (params.cursor ?? "")]
+      if (page) return page
+      return { resourceTemplates: this._state?.resourceTemplates ?? [] }
+    }
+
+    async complete(
+      params: {
+        ref: { type: "ref/prompt"; name: string } | { type: "ref/resource"; uri: string }
+        argument: { name: string; value: string }
+        context?: { arguments?: Record<string, string> }
+      },
+      options?: { timeout?: number },
+    ) {
+      if (this._state) {
+        this._state.completeCalls++
+        this._state.completeTimeout = options?.timeout
+        this._state.completeRequests.push(params)
+      }
+      return { completion: { values: [`${params.argument.value}-one`, `${params.argument.value}-two`], total: 2 } }
+    }
+
     async getPrompt(_params: unknown, options?: { timeout?: number }) {
       if (this._state) this._state.getPromptTimeout = options?.timeout
       return { messages: [] }
@@ -353,7 +394,7 @@ it.instance(
 )
 
 it.instance(
-  "follows cursors when listing tools, prompts, and resources",
+  "follows cursors when listing tools, prompts, resources, and resource templates",
   () =>
     MCP.Service.use((mcp: MCPNS.Interface) =>
       Effect.gen(function* () {
@@ -374,6 +415,13 @@ it.instance(
           initial: { resources: [{ name: "resource-one", uri: "test://one" }], nextCursor: "resources-2" },
           "resources-2": { resources: [{ name: "resource-two", uri: "test://two" }] },
         }
+        serverState.resourceTemplatePages = {
+          initial: {
+            resourceTemplates: [{ name: "template-one", uriTemplate: "test://one/{id}" }],
+            nextCursor: "templates-2",
+          },
+          "templates-2": { resourceTemplates: [{ name: "template-two", uriTemplate: "test://two/{id}" }] },
+        }
 
         yield* mcp.add("paged-server", {
           type: "local",
@@ -383,9 +431,14 @@ it.instance(
         expect(Object.keys(yield* mcp.tools())).toEqual(["paged-server_tool-one", "paged-server_tool-two"])
         expect(Object.keys(yield* mcp.prompts())).toEqual(["paged-server:prompt-one", "paged-server:prompt-two"])
         expect(Object.keys(yield* mcp.resources())).toEqual(["paged-server:resource-one", "paged-server:resource-two"])
+        expect(Object.keys(yield* mcp.resourceTemplates())).toEqual([
+          "paged-server:template-one",
+          "paged-server:template-two",
+        ])
         expect(serverState.listToolsCalls).toBe(2)
         expect(serverState.listPromptsCalls).toBe(2)
         expect(serverState.listResourcesCalls).toBe(2)
+        expect(serverState.listResourceTemplatesCalls).toBe(2)
       }),
     ),
   { config: { mcp: {} } },
@@ -1032,6 +1085,59 @@ it.instance(
 )
 
 it.instance(
+  "resourceTemplates() returns templates from connected resource servers",
+  () =>
+    MCP.Service.use((mcp: MCPNS.Interface) =>
+      Effect.gen(function* () {
+        lastCreatedClientName = "resource-template-server"
+        const serverState = getOrCreateClientState("resource-template-server")
+        serverState.capabilities = { resources: {} }
+        serverState.resourceTemplates = [
+          {
+            name: "repo-file",
+            uriTemplate: "repo://{owner}/{repo}/files/{path}",
+            description: "Repository file",
+          },
+        ]
+
+        yield* mcp.add("resource-template-server", {
+          type: "local",
+          command: ["echo", "test"],
+        })
+
+        const templates = yield* mcp.resourceTemplates()
+        expect(Object.keys(templates)).toEqual(["resource-template-server:repo-file"])
+        expect(templates["resource-template-server:repo-file"]?.uriTemplate).toBe("repo://{owner}/{repo}/files/{path}")
+        expect(templates["resource-template-server:repo-file"]?.client).toBe("resource-template-server")
+        expect(serverState.listResourceTemplatesCalls).toBe(1)
+      }),
+    ),
+  { config: { mcp: {} } },
+)
+
+it.instance(
+  "resourceTemplates() skips servers without resource capability",
+  () =>
+    MCP.Service.use((mcp: MCPNS.Interface) =>
+      Effect.gen(function* () {
+        lastCreatedClientName = "tool-only-template-server"
+        const serverState = getOrCreateClientState("tool-only-template-server")
+        serverState.capabilities = { tools: {} }
+        serverState.resourceTemplates = [{ name: "hidden", uriTemplate: "hidden://{id}" }]
+
+        yield* mcp.add("tool-only-template-server", {
+          type: "local",
+          command: ["echo", "test"],
+        })
+
+        expect(yield* mcp.resourceTemplates()).toEqual({})
+        expect(serverState.listResourceTemplatesCalls).toBe(0)
+      }),
+    ),
+  { config: { mcp: {} } },
+)
+
+it.instance(
   "uses per-server timeouts for prompt and resource requests",
   () =>
     MCP.Service.use((mcp: MCPNS.Interface) =>
@@ -1052,6 +1158,80 @@ it.instance(
       }),
     ),
   { config: { mcp: {}, experimental: { mcp_timeout: 5000 } } },
+)
+
+it.instance(
+  "complete() forwards prompt and resource template references with context",
+  () =>
+    MCP.Service.use((mcp: MCPNS.Interface) =>
+      Effect.gen(function* () {
+        lastCreatedClientName = "completion-server"
+        const serverState = getOrCreateClientState("completion-server")
+        serverState.capabilities = { prompts: {}, resources: {}, completions: {} }
+
+        yield* mcp.add("completion-server", {
+          type: "local",
+          command: ["echo", "test"],
+          timeout: 2500,
+        })
+
+        const prompt = yield* mcp.complete(
+          "completion-server",
+          { type: "ref/prompt", name: "review" },
+          { name: "path", value: "src" },
+        )
+        const resource = yield* mcp.complete(
+          "completion-server",
+          { type: "ref/resource", uri: "repo://{owner}/{repo}/files/{path}" },
+          { name: "path", value: "src" },
+          { arguments: { owner: "opencode-ai", repo: "opencode" } },
+        )
+
+        expect(prompt?.completion.values).toEqual(["src-one", "src-two"])
+        expect(resource?.completion.values).toEqual(["src-one", "src-two"])
+        expect(serverState.completeCalls).toBe(2)
+        expect(serverState.completeTimeout).toBe(2500)
+        expect(serverState.completeRequests).toEqual([
+          {
+            ref: { type: "ref/prompt", name: "review" },
+            argument: { name: "path", value: "src" },
+          },
+          {
+            ref: { type: "ref/resource", uri: "repo://{owner}/{repo}/files/{path}" },
+            argument: { name: "path", value: "src" },
+            context: { arguments: { owner: "opencode-ai", repo: "opencode" } },
+          },
+        ])
+      }),
+    ),
+  { config: { mcp: {}, experimental: { mcp_timeout: 5000 } } },
+)
+
+it.instance(
+  "complete() skips servers without completion capability",
+  () =>
+    MCP.Service.use((mcp: MCPNS.Interface) =>
+      Effect.gen(function* () {
+        lastCreatedClientName = "no-completion-server"
+        const serverState = getOrCreateClientState("no-completion-server")
+        serverState.capabilities = { prompts: {} }
+
+        yield* mcp.add("no-completion-server", {
+          type: "local",
+          command: ["echo", "test"],
+        })
+
+        const result = yield* mcp.complete(
+          "no-completion-server",
+          { type: "ref/prompt", name: "review" },
+          { name: "path", value: "src" },
+        )
+
+        expect(result).toBeUndefined()
+        expect(serverState.completeCalls).toBe(0)
+      }),
+    ),
+  { config: { mcp: {} } },
 )
 
 it.instance(
